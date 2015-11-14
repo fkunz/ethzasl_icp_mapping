@@ -13,6 +13,7 @@
   <url>http://ros.org/wiki/ethzasl_gridmap_2d</url>
   <depend package="roscpp"/>
   <depend package="nav_msgs"/>
+  <depend package="cmake_modules"/>
   <rosdep name="eigen"/>
   <export>
     <cpp cflags="-I${prefix}/include" lflags="-L${prefix}/lib -Wl,-rpath,${prefix}/lib -lethzasl_gridmap_2d" />
