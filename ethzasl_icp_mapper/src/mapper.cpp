@@ -101,6 +101,7 @@ class Mapper
 	int minReadingPointCount;
 	int minMapPointCount;
 	int inputQueueSize;
+	double maxMeanError;
 	double minOverlap;
 	double maxOverlapToMerge;
 	double minOverlapToMerge;
@@ -128,6 +129,10 @@ protected:
 	void gotScan(const sensor_msgs::LaserScan& scanMsgIn);
 	void gotCloud(const sensor_msgs::PointCloud2& cloudMsgIn);
 	void processCloud(unique_ptr<DP> cloud, const std::string& scannerFrame, const ros::Time& stamp, uint32_t seq);
+	bool prepareForICP(DP* cloud, const std::string& scannerFrame, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner);
+	bool applyICP(DP* cloud, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp);
+	void applyMapping(DP* cloud, const ros::Time& stamp, PM::TransformationParameters& Ticp);
+	void writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp);
 	void processNewMapIfAvailable();
 	void setMap(DP* newPointCloud);
 	DP* updateMap(DP* newPointCloud, const PM::TransformationParameters Ticp, bool updateExisting);
@@ -163,10 +168,11 @@ Mapper::Mapper(ros::NodeHandle& n, ros::NodeHandle& pn):
 	minReadingPointCount(getParam<int>("minReadingPointCount", 2000)),
 	minMapPointCount(getParam<int>("minMapPointCount", 500)),
 	inputQueueSize(getParam<int>("inputQueueSize", 10)),
+	maxMeanError(getParam<double>("maxMeanError", 0.8)),
 	minOverlap(getParam<double>("minOverlap", 0.5)),
 	maxOverlapToMerge(getParam<double>("maxOverlapToMerge", 0.9)),
-	minOverlapToMerge(getParam<double>("minOverlapToMerge", 0.8)),
-	maxMeanErrorToMerge(getParam<double>("maxMeanErrorToMerge", 0.05)),
+	minOverlapToMerge(getParam<double>("minOverlapToMerge", 0.3)),
+	maxMeanErrorToMerge(getParam<double>("maxMeanErrorToMerge", 0.2)),
 	tfRefreshPeriod(getParam<double>("tfRefreshPeriod", 0.01)),
 	publishTfAsParent(getParam<bool>("publish_tf_as_parent", true)),
 	odomFrame(getParam<string>("odom_frame", "odom")),
@@ -359,24 +365,64 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	// IMPORTANT:  We need to receive the point clouds in local coordinates (scanner or robot)
 	timer t;
 
+	DP* newDataPoints = newPointCloud.release();
+	PM::TransformationParameters TScannerToMap, TOdomToScanner, Ticp;
+	if (!prepareForICP(newDataPoints, scannerFrame, stamp, TScannerToMap, TOdomToScanner))
+		return;
+
+	bool mapCurrentCloud = applyICP(newDataPoints, stamp, TScannerToMap, TOdomToScanner, Ticp);
+
+	writeDebugInfo(mapCurrentCloud, TScannerToMap, TOdomToScanner, Ticp);
+
+	// check if news points should be added to the map
+	if (mapCurrentCloud &&
+		(icp.getInternalMap().features.cols() < minMapPointCount) &&
+		#if BOOST_VERSION >= 104100
+		(!mapBuildingInProgress)
+		#else // BOOST_VERSION >= 104100
+		true
+		#endif // BOOST_VERSION >= 104100
+	)
+	{
+		applyMapping(newDataPoints, stamp, Ticp);
+	} else
+	{
+		delete newDataPoints;
+	}
+
+	//Statistics about time and real-time capability
+	int realTimeRatio = 100*t.elapsed() / (stamp.toSec()-lastPoinCloudTime.toSec());
+	ROS_INFO_STREAM("[TIME] Total ICP took: " << t.elapsed() << " [s]");
+	if(realTimeRatio < 80)
+		ROS_INFO_STREAM("[TIME] Real-time capability: " << realTimeRatio << "%");
+	else
+		ROS_WARN_STREAM("[TIME] Real-time capability: " << realTimeRatio << "%");
+
+	lastPoinCloudTime = stamp;
+}
+
+bool Mapper::prepareForICP(DP* newPointCloud, const std::string& scannerFrame, const ros::Time& stamp,
+						   PM::TransformationParameters& TScannerToMap,
+						   PM::TransformationParameters& TOdomToScanner)
+{
 	// Convert point cloud
 	const size_t goodCount(newPointCloud->features.cols());
 	if (goodCount == 0)
 	{
 		ROS_ERROR("I found no good points in the cloud");
-		return;
+		return false;
 	}
-	
+
 	// Dimension of the point cloud, important since we handle 2D and 3D
 	const int dimp1(newPointCloud->features.rows());
 
 	ROS_INFO("Processing new point cloud");
 	{
 		timer t; // Print how long take the algo
-		
+
 		// Apply filters to incoming cloud, in scanner coordinates
 		inputFilters.apply(*newPointCloud);
-		
+
 		ROS_INFO_STREAM("Input filters took " << t.elapsed() << " [s]");
 	}
 
@@ -392,7 +438,6 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 
 	// Fetch transformation from scanner to odom
 	// Note: we don't need to wait for transform. It is already called in transformListenerToEigenMatrix()
-	PM::TransformationParameters TOdomToScanner;
 	try
 	{
 		TOdomToScanner = PointMatcher_ros::eigenMatrixToDim<float>(
@@ -402,22 +447,22 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	catch(tf::ExtrapolationException e)
 	{
 		ROS_ERROR_STREAM("Extrapolation Exception. stamp = "<< stamp << " now = " << ros::Time::now() << " delta = " << ros::Time::now() - stamp);
-		return;
+		return false;
 	}
 
 	ROS_DEBUG_STREAM("\n");
 	ROS_DEBUG_STREAM("TOdomToScanner(" << odomFrame<< " to " << scannerFrame << "):\n" << TOdomToScanner);
 	ROS_DEBUG_STREAM("TOdomToMap(" << odomFrame<< " to " << mapFrame << "):\n" << TOdomToMap);
 
-	const PM::TransformationParameters TscannerToMap = transformation->correctParameters(TOdomToMap * TOdomToScanner.inverse());
-	ROS_DEBUG_STREAM("TscannerToMap (" << scannerFrame << " to " << mapFrame << "):\n" << TscannerToMap);
+	TScannerToMap = transformation->correctParameters(TOdomToMap * TOdomToScanner.inverse());
+	ROS_DEBUG_STREAM("TscannerToMap (" << scannerFrame << " to " << mapFrame << "):\n" << TScannerToMap);
 
 	// Ensure a minimum amount of point after filtering
 	const int ptsCount = newPointCloud->features.cols();
 	if(ptsCount < minReadingPointCount)
 	{
 		ROS_ERROR_STREAM("Not enough points in newPointCloud: only " << ptsCount << " pts.");
-		return;
+		return false;
 	}
 
 	// Initialize the map if empty
@@ -425,78 +470,55 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	{
 		ROS_INFO_STREAM("Creating an initial map");
 		mapCreationTime = stamp;
-		setMap(updateMap(newPointCloud.release(), TscannerToMap, false));
+		setMap(updateMap(newPointCloud, TScannerToMap, false));
 		// we must not delete newPointCloud because we just stored it in the mapPointCloud
-		return;
+		return false;
 	}
 
 	// Check dimension
 	if (newPointCloud->features.rows() != icp.getInternalMap().features.rows())
 	{
 		ROS_ERROR_STREAM("Dimensionality missmatch: incoming cloud is " << newPointCloud->features.rows()-1 << " while map is " << icp.getInternalMap().features.rows()-1);
-		return;
+		return false;
 	}
+	return true;
+}
 
+bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp)
+{
+	bool mapCurrentCloud = mapping;
 	try
 	{
 		// Apply ICP
-		PM::TransformationParameters Ticp;
-
-		Ticp = icp(*newPointCloud, TscannerToMap);
+		Ticp = icp(*newPointCloud, TScannerToMap);
 
 		ROS_DEBUG_STREAM("Ticp:\n" << Ticp);
-		
+
 		// Ensure minimum overlap between scans
 		const double estimatedOverlap = icp.errorMinimizer->getOverlap();
 		ROS_INFO_STREAM("Overlap: " << estimatedOverlap);
 		if (estimatedOverlap < minOverlap)
 		{
 			ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!");
-			return;
+			return false;
 		}
 
-		if (covariancePub.getNumSubscribers())
+		// Ensure maximum mean error between scans
+		const double meanError = icp.errorMinimizer->getMean();
+		ROS_INFO_STREAM("Mean Error: " << meanError);
+		if (meanError > maxMeanError)
 		{
-			std_msgs::Float64MultiArray covariance;
-			tf::matrixEigenToMsg(icp.errorMinimizer->getCovariance(), covariance);
-			covariancePub.publish(covariance);
+			ROS_ERROR_STREAM("Mean error too big!");
+			// TODO(fkunz): Check if system is initialized.
+//			return false;
 		}
 
-		std_msgs::Float64 float_msg;
-		if (meanErrorPub.getNumSubscribers())
+		// Ensure minimum scan quality for mapping
+		if (estimatedOverlap < minOverlapToMerge &&
+			meanError > maxMeanErrorToMerge)
 		{
-			float_msg.data = icp.errorMinimizer->getMean();
-			meanErrorPub.publish(float_msg);
-		}
-
-		if (meanErrorScaledPub.getNumSubscribers())
-		{
-			float_msg.data = icp.errorMinimizer->getMean() * 10;
-			meanErrorScaledPub.publish(float_msg);
-		}
-
-		if (overlapPub.getNumSubscribers())
-		{
-			float_msg.data = icp.errorMinimizer->getOverlap();
-			overlapPub.publish(float_msg);
-		}
-
-		if (pointUsedRatioPub.getNumSubscribers())
-		{
-			float_msg.data = icp.errorMinimizer->getPointUsedRatio();
-			pointUsedRatioPub.publish(float_msg);
-		}
-
-		if (weightedPointUsedRatioPub.getNumSubscribers())
-		{
-			float_msg.data = icp.errorMinimizer->getWeightedPointUsedRatio();
-			weightedPointUsedRatioPub.publish(float_msg);
-		}
-
-		if (icp.errorMinimizer->getOverlap() < minOverlapToMerge &&
-			icp.errorMinimizer->getMean() > maxMeanErrorToMerge)
-		{
-			ROS_ERROR_STREAM("Overlap to small and mean error to large.");
+			ROS_ERROR_STREAM("Will not map! Overlap to small and mean error to large.");
+			mapCurrentCloud = false;
 		}
 
 		// Compute tf
@@ -507,28 +529,6 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 		publishOdomTransform(stamp);
 		publishLock.unlock();
 		processingNewCloud = false;
-
-//		ROS_DEBUG_STREAM("Mean:\n" << icp.errorMinimizer->getMean());
-//		ROS_DEBUG_STREAM("Covariance:\n" << icp.errorMinimizer->getCovariance());
-//		ROS_DEBUG_STREAM("Overlap:\n" << icp.errorMinimizer->getOverlap());
-//		ROS_DEBUG_STREAM("PointUsedRatio:\n" << icp.errorMinimizer->getPointUsedRatio());
-//		ROS_DEBUG_STREAM("WeightedPointUsedRatio:\n" << icp.errorMinimizer->getWeightedPointUsedRatio());
-
-//		ROS_DEBUG_STREAM("TscannerToMap:\n" << TscannerToMap);
-//		ROS_DEBUG_STREAM("TOdomToScanner:\n" << TOdomToScanner);
-//		ROS_DEBUG_STREAM("Ticp:\n" << Ticp);
-		ROS_DEBUG_STREAM("TOdomToMap:\n" << TOdomToMap);
-
-		logfile << "\nCovariance: " << icp.errorMinimizer->getCovariance();
-		logfile << "\nMean: " << icp.errorMinimizer->getMean();
-		logfile << "\nOverlap: " << icp.errorMinimizer->getOverlap();
-		logfile << "\nPointUsedRatio: " << icp.errorMinimizer->getPointUsedRatio();
-		logfile << "\nWeightedPointUsedRatio: " << icp.errorMinimizer->getWeightedPointUsedRatio();
-		logfile << "\nTscannerToMap:\n" << TscannerToMap;
-		logfile << "\nTOdomToScanner\n" << TOdomToScanner;
-		logfile << "\nTicp\n" << Ticp;
-		logfile << "\nTOdomToMap\n" << TOdomToMap;
-		logfile << "\n-----------------------------------------------------------------------------------------------------\n";
 
 		// Publish odometry
 		if (odomPub.getNumSubscribers())
@@ -544,47 +544,101 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 			//DP outliers = PM::extractOutliers(transformation->compute(*newPointCloud, Ticp), *mapPointCloud, 0.6);
 			//outlierPub.publish(PointMatcher_ros::pointMatcherCloudToRosMsg<float>(outliers, mapFrame, mapCreationTime));
 		}
-
-		// check if news points should be added to the map
-		if (
-			mapping &&
-			((estimatedOverlap < maxOverlapToMerge) || (icp.getInternalMap().features.cols() < minMapPointCount)) &&
-			#if BOOST_VERSION >= 104100
-			(!mapBuildingInProgress)
-			#else // BOOST_VERSION >= 104100
-			true
-			#endif // BOOST_VERSION >= 104100
-		)
-		{
-			// make sure we process the last available map
-			mapCreationTime = stamp;
-			#if BOOST_VERSION >= 104100
-			ROS_INFO("Adding new points to the map in background");
-			mapBuildingTask = MapBuildingTask(boost::bind(&Mapper::updateMap, this, newPointCloud.release(), Ticp, true));
-			mapBuildingFuture = mapBuildingTask.get_future();
-			mapBuildingThread = boost::thread(boost::move(boost::ref(mapBuildingTask)));
-			mapBuildingInProgress = true;
-			#else // BOOST_VERSION >= 104100
-			ROS_INFO("Adding new points to the map");
-			setMap(updateMap( newPointCloud.release(), Ticp, true));
-			#endif // BOOST_VERSION >= 104100
-		}
 	}
 	catch (PM::ConvergenceError error)
 	{
 		ROS_ERROR_STREAM("ICP failed to converge: " << error.what());
-		return;
+		return false;
+	}
+	return mapCurrentCloud;
+}
+
+void Mapper::applyMapping(DP* newPointCloud, const ros::Time& stamp, PM::TransformationParameters& Ticp)
+{
+//	try
+//	{
+		// make sure we process the last available map
+		mapCreationTime = stamp;
+		#if BOOST_VERSION >= 104100
+		ROS_INFO("Adding new points to the map in background");
+		mapBuildingTask = MapBuildingTask(boost::bind(&Mapper::updateMap, this, newPointCloud, Ticp, true));
+		mapBuildingFuture = mapBuildingTask.get_future();
+		mapBuildingThread = boost::thread(boost::move(boost::ref(mapBuildingTask)));
+		mapBuildingInProgress = true;
+		#else // BOOST_VERSION >= 104100
+		ROS_INFO("Adding new points to the map");
+		setMap(updateMap( newPointCloud, Ticp, true));
+		#endif // BOOST_VERSION >= 104100
+//	}
+//	catch (PM::ConvergenceError error)
+//	{
+//		ROS_ERROR_STREAM("ICP failed to converge: " << error.what());
+//		return;
+//	}
+}
+
+void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp)
+{
+	if (covariancePub.getNumSubscribers())
+	{
+		std_msgs::Float64MultiArray covariance;
+		tf::matrixEigenToMsg(icp.errorMinimizer->getCovariance(), covariance);
+		covariancePub.publish(covariance);
 	}
 
-	//Statistics about time and real-time capability
-	int realTimeRatio = 100*t.elapsed() / (stamp.toSec()-lastPoinCloudTime.toSec());
-	ROS_INFO_STREAM("[TIME] Total ICP took: " << t.elapsed() << " [s]");
-	if(realTimeRatio < 80)
-		ROS_INFO_STREAM("[TIME] Real-time capability: " << realTimeRatio << "%");
-	else
-		ROS_WARN_STREAM("[TIME] Real-time capability: " << realTimeRatio << "%");
+	std_msgs::Float64 float_msg;
+	if (meanErrorPub.getNumSubscribers())
+	{
+		float_msg.data = icp.errorMinimizer->getMean();
+		meanErrorPub.publish(float_msg);
+	}
 
-	lastPoinCloudTime = stamp;
+	if (overlapPub.getNumSubscribers() &&
+		mapCurrentCloud)
+	{
+		float_msg.data = icp.errorMinimizer->getOverlap();
+		overlapPub.publish(float_msg);
+	}
+
+	if (pointUsedRatioPub.getNumSubscribers())
+	{
+		float_msg.data = icp.errorMinimizer->getPointUsedRatio();
+		pointUsedRatioPub.publish(float_msg);
+	}
+
+	if (weightedPointUsedRatioPub.getNumSubscribers())
+	{
+		float_msg.data = icp.errorMinimizer->getWeightedPointUsedRatio();
+		weightedPointUsedRatioPub.publish(float_msg);
+	}
+
+	if (meanErrorScaledPub.getNumSubscribers() &&
+		mapCurrentCloud)
+	{
+		float_msg.data = icp.errorMinimizer->getMean() * 10;
+		meanErrorScaledPub.publish(float_msg);
+	}
+
+//	ROS_DEBUG_STREAM("Covariance:\n" << icp.errorMinimizer->getCovariance());
+//	ROS_DEBUG_STREAM("Mean:\n" << icp.errorMinimizer->getMean());
+//	ROS_DEBUG_STREAM("Overlap:\n" << icp.errorMinimizer->getOverlap());
+//	ROS_DEBUG_STREAM("PointUsedRatio:\n" << icp.errorMinimizer->getPointUsedRatio());
+//	ROS_DEBUG_STREAM("WeightedPointUsedRatio:\n" << icp.errorMinimizer->getWeightedPointUsedRatio());
+//	ROS_DEBUG_STREAM("TscannerToMap:\n" << TscannerToMap);
+//	ROS_DEBUG_STREAM("TOdomToScanner:\n" << TOdomToScanner);
+//	ROS_DEBUG_STREAM("Ticp:\n" << Ticp);
+	ROS_DEBUG_STREAM("TOdomToMap:\n" << Ticp * TOdomToScanner);
+
+	logfile << "\nCovariance: " << icp.errorMinimizer->getCovariance();
+	logfile << "\nMean: " << icp.errorMinimizer->getMean();
+	logfile << "\nOverlap: " << icp.errorMinimizer->getOverlap();
+	logfile << "\nPointUsedRatio: " << icp.errorMinimizer->getPointUsedRatio();
+	logfile << "\nWeightedPointUsedRatio: " << icp.errorMinimizer->getWeightedPointUsedRatio();
+	logfile << "\nTscannerToMap:\n" << TScannerToMap;
+	logfile << "\nTOdomToScanner\n" << TOdomToScanner;
+	logfile << "\nTicp\n" << Ticp;
+	logfile << "\nTOdomToMap\n" << Ticp * TOdomToScanner;
+	logfile << "\n-----------------------------------------------------------------------------------------------------\n";
 }
 
 void Mapper::processNewMapIfAvailable()
@@ -842,6 +896,7 @@ int main(int argc, char **argv)
 	ros::NodeHandle pn("~");
 	Mapper mapper(n, pn);
 	ros::spin();
+	ros::shutdown();
 
 	return 0;
 }
