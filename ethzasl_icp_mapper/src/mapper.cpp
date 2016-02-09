@@ -360,6 +360,7 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	BoolSetter stopProcessingSetter(processingNewCloud, false);
 
 	// if the future has completed, use the new map
+	ROS_INFO_STREAM("mapBuildingInProgress1: " << mapBuildingInProgress);
 	processNewMapIfAvailable();
 	
 	// IMPORTANT:  We need to receive the point clouds in local coordinates (scanner or robot)
@@ -375,8 +376,10 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	writeDebugInfo(mapCurrentCloud, TScannerToMap, TOdomToScanner, Ticp);
 
 	// check if news points should be added to the map
+	ROS_INFO_STREAM("mapCurrentCloud: " << mapCurrentCloud);
+	ROS_INFO_STREAM("mapFeatures: " << icp.getInternalMap().features.cols());
+	ROS_INFO_STREAM("mapBuildingInProgress2: " << mapBuildingInProgress);
 	if (mapCurrentCloud &&
-		(icp.getInternalMap().features.cols() < minMapPointCount) &&
 		#if BOOST_VERSION >= 104100
 		(!mapBuildingInProgress)
 		#else // BOOST_VERSION >= 104100
@@ -384,9 +387,11 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 		#endif // BOOST_VERSION >= 104100
 	)
 	{
+		ROS_INFO_STREAM("applyMapping.");
 		applyMapping(newDataPoints, stamp, Ticp);
 	} else
 	{
+		ROS_INFO_STREAM("delete Pointcloud");
 		delete newDataPoints;
 	}
 
@@ -500,7 +505,7 @@ bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::Transformat
 		if (estimatedOverlap < minOverlap)
 		{
 			ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!");
-			return false;
+			mapCurrentCloud = false;
 		}
 
 		// Ensure maximum mean error between scans
@@ -510,14 +515,16 @@ bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::Transformat
 		{
 			ROS_ERROR_STREAM("Mean error too big!");
 			// TODO(fkunz): Check if system is initialized.
-//			return false;
+			mapCurrentCloud = false;
 		}
 
 		// Ensure minimum scan quality for mapping
 		if (estimatedOverlap < minOverlapToMerge &&
 			meanError > maxMeanErrorToMerge)
 		{
-			ROS_ERROR_STREAM("Will not map! Overlap to small and mean error to large.");
+			ROS_ERROR_STREAM("Will not map! Overlap to small and mean error to large. "
+							 << estimatedOverlap << "/" << minOverlapToMerge << " "
+							 << meanError << "/" << maxMeanErrorToMerge);
 			mapCurrentCloud = false;
 		}
 
@@ -555,26 +562,18 @@ bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::Transformat
 
 void Mapper::applyMapping(DP* newPointCloud, const ros::Time& stamp, PM::TransformationParameters& Ticp)
 {
-//	try
-//	{
-		// make sure we process the last available map
-		mapCreationTime = stamp;
-		#if BOOST_VERSION >= 104100
-		ROS_INFO("Adding new points to the map in background");
-		mapBuildingTask = MapBuildingTask(boost::bind(&Mapper::updateMap, this, newPointCloud, Ticp, true));
-		mapBuildingFuture = mapBuildingTask.get_future();
-		mapBuildingThread = boost::thread(boost::move(boost::ref(mapBuildingTask)));
-		mapBuildingInProgress = true;
-		#else // BOOST_VERSION >= 104100
-		ROS_INFO("Adding new points to the map");
-		setMap(updateMap( newPointCloud, Ticp, true));
-		#endif // BOOST_VERSION >= 104100
-//	}
-//	catch (PM::ConvergenceError error)
-//	{
-//		ROS_ERROR_STREAM("ICP failed to converge: " << error.what());
-//		return;
-//	}
+	// make sure we process the last available map
+	mapCreationTime = stamp;
+	#if BOOST_VERSION >= 104100
+	ROS_INFO("Adding new points to the map in background");
+	mapBuildingTask = MapBuildingTask(boost::bind(&Mapper::updateMap, this, newPointCloud, Ticp, true));
+	mapBuildingFuture = mapBuildingTask.get_future();
+	mapBuildingThread = boost::thread(boost::move(boost::ref(mapBuildingTask)));
+	mapBuildingInProgress = true;
+	#else // BOOST_VERSION >= 104100
+	ROS_INFO("Adding new points to the map");
+	setMap(updateMap( newPointCloud, Ticp, true));
+	#endif // BOOST_VERSION >= 104100
 }
 
 void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp)
@@ -643,6 +642,7 @@ void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& 
 
 void Mapper::processNewMapIfAvailable()
 {
+	ROS_INFO_STREAM("processNewMapIfAvailable");
 	#if BOOST_VERSION >= 104100
 	if (mapBuildingInProgress && mapBuildingFuture.has_value())
 	{
@@ -655,6 +655,7 @@ void Mapper::processNewMapIfAvailable()
 
 void Mapper::setMap(DP* newPointCloud)
 {
+	ROS_INFO_STREAM("Set map.");
 	// delete old map
 	if (mapPointCloud)
 		delete mapPointCloud;
@@ -667,6 +668,7 @@ void Mapper::setMap(DP* newPointCloud)
 	// FIXME this crash when used without descriptor
 	if (mapPub.getNumSubscribers())
 		mapPub.publish(PointMatcher_ros::pointMatcherCloudToRosMsg<float>(*mapPointCloud, mapFrame, mapCreationTime));
+	ROS_INFO_STREAM("Set map finished.");
 }
 
 Mapper::DP* Mapper::updateMap(DP* newPointCloud, const PM::TransformationParameters Ticp, bool updateExisting)
