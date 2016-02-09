@@ -58,7 +58,9 @@ class Mapper
 	ros::Publisher covariancePub;
 	ros::Publisher meanErrorPub;
 	ros::Publisher meanErrorScaledPub;
+	ros::Publisher meanErrorScaledUnfilteredPub;
 	ros::Publisher overlapPub;
+	ros::Publisher overlapUnfilteredPub;
 	ros::Publisher pointUsedRatioPub;
 	ros::Publisher weightedPointUsedRatioPub;
 
@@ -102,9 +104,9 @@ class Mapper
 	int minMapPointCount;
 	int inputQueueSize;
 	double maxMeanError;
-	double minOverlap;
-	double maxOverlapToMerge;
+	double minOverlapToLocalize;
 	double minOverlapToMerge;
+	double maxMeanErrorToLocalize;
 	double maxMeanErrorToMerge;
 	double tfRefreshPeriod;  //!< if set to zero, tf will be publish at the rate of the incoming point cloud messages
 	string odomFrame;
@@ -169,9 +171,9 @@ Mapper::Mapper(ros::NodeHandle& n, ros::NodeHandle& pn):
 	minMapPointCount(getParam<int>("minMapPointCount", 500)),
 	inputQueueSize(getParam<int>("inputQueueSize", 10)),
 	maxMeanError(getParam<double>("maxMeanError", 0.8)),
-	minOverlap(getParam<double>("minOverlap", 0.5)),
-	maxOverlapToMerge(getParam<double>("maxOverlapToMerge", 0.9)),
+	minOverlapToLocalize(getParam<double>("minOverlapToLocalize", 0.5)),
 	minOverlapToMerge(getParam<double>("minOverlapToMerge", 0.3)),
+	maxMeanErrorToLocalize(getParam<double>("maxMeanErrorToLocalize", 0.2)),
 	maxMeanErrorToMerge(getParam<double>("maxMeanErrorToMerge", 0.2)),
 	tfRefreshPeriod(getParam<double>("tfRefreshPeriod", 0.01)),
 	publishTfAsParent(getParam<bool>("publish_tf_as_parent", true)),
@@ -279,7 +281,9 @@ Mapper::Mapper(ros::NodeHandle& n, ros::NodeHandle& pn):
 	covariancePub = pn.advertise<std_msgs::Float64MultiArray>("covariance", 50, true);
 	meanErrorPub = pn.advertise<std_msgs::Float64>("mean_error", 50, true);
 	meanErrorScaledPub = pn.advertise<std_msgs::Float64>("mean_error_scaled", 50, true);
+	meanErrorScaledUnfilteredPub = pn.advertise<std_msgs::Float64>("mean_error_scaled_unfiltered", 50, true);
 	overlapPub = pn.advertise<std_msgs::Float64>("overlap", 50, true);
+	overlapUnfilteredPub = pn.advertise<std_msgs::Float64>("overlap_unfiltered", 50, true);
 	pointUsedRatioPub = pn.advertise<std_msgs::Float64>("pointUsedRatio", 50, true);
 	weightedPointUsedRatioPub = pn.advertise<std_msgs::Float64>("weightedPointUsedRatio", 50, true);
 	getPointMapSrv = n.advertiseService("dynamic_point_map", &Mapper::getPointMap, this);
@@ -360,7 +364,6 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	BoolSetter stopProcessingSetter(processingNewCloud, false);
 
 	// if the future has completed, use the new map
-	ROS_INFO_STREAM("mapBuildingInProgress1: " << mapBuildingInProgress);
 	processNewMapIfAvailable();
 	
 	// IMPORTANT:  We need to receive the point clouds in local coordinates (scanner or robot)
@@ -376,9 +379,8 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 	writeDebugInfo(mapCurrentCloud, TScannerToMap, TOdomToScanner, Ticp);
 
 	// check if news points should be added to the map
-	ROS_INFO_STREAM("mapCurrentCloud: " << mapCurrentCloud);
-	ROS_INFO_STREAM("mapFeatures: " << icp.getInternalMap().features.cols());
-	ROS_INFO_STREAM("mapBuildingInProgress2: " << mapBuildingInProgress);
+	if (mapCurrentCloud)
+		ROS_WARN_STREAM("mapCurrentCloud");
 	if (mapCurrentCloud &&
 		#if BOOST_VERSION >= 104100
 		(!mapBuildingInProgress)
@@ -387,11 +389,9 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 		#endif // BOOST_VERSION >= 104100
 	)
 	{
-		ROS_INFO_STREAM("applyMapping.");
 		applyMapping(newDataPoints, stamp, Ticp);
 	} else
 	{
-		ROS_INFO_STREAM("delete Pointcloud");
 		delete newDataPoints;
 	}
 
@@ -498,31 +498,37 @@ bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::Transformat
 		Ticp = icp(*newPointCloud, TScannerToMap);
 
 		ROS_DEBUG_STREAM("Ticp:\n" << Ticp);
-
-		// Ensure minimum overlap between scans
 		const double estimatedOverlap = icp.errorMinimizer->getOverlap();
-		ROS_INFO_STREAM("Overlap: " << estimatedOverlap);
-		if (estimatedOverlap < minOverlap)
+		const double meanError = icp.errorMinimizer->getMean();
+		ROS_DEBUG_STREAM("Overlap: " << estimatedOverlap);
+		ROS_DEBUG_STREAM("Mean Error: " << meanError);
+
+		// Ensure minimum overlap for localization
+		if (estimatedOverlap < minOverlapToLocalize)
 		{
-			ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!");
-			mapCurrentCloud = false;
+			ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!" << estimatedOverlap << "/" << minOverlapToLocalize);
+			return false;
 		}
 
-		// Ensure maximum mean error between scans
-		const double meanError = icp.errorMinimizer->getMean();
-		ROS_INFO_STREAM("Mean Error: " << meanError);
+		// Ensure maximum mean error for localization
+		if (meanError > maxMeanErrorToLocalize)
+		{
+			ROS_ERROR_STREAM("Mean error too big, ignoring ICP correction! " << meanError << "/" << maxMeanErrorToLocalize);
+			return false;
+		}
+
+		// Ensure maximum mean error for mapping
 		if (meanError > maxMeanError)
 		{
-			ROS_ERROR_STREAM("Mean error too big!");
-			// TODO(fkunz): Check if system is initialized.
+			ROS_ERROR_STREAM("Mean error too big, ignoring point cloud! " << meanError << "/" << maxMeanError);
 			mapCurrentCloud = false;
 		}
 
 		// Ensure minimum scan quality for mapping
-		if (estimatedOverlap < minOverlapToMerge &&
+		if (estimatedOverlap > minOverlapToMerge &&
 			meanError > maxMeanErrorToMerge)
 		{
-			ROS_ERROR_STREAM("Will not map! Overlap to small and mean error to large. "
+			ROS_ERROR_STREAM("Overlap to small and mean error to big, ignoring point cloud! "
 							 << estimatedOverlap << "/" << minOverlapToMerge << " "
 							 << meanError << "/" << maxMeanErrorToMerge);
 			mapCurrentCloud = false;
@@ -592,11 +598,16 @@ void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& 
 		meanErrorPub.publish(float_msg);
 	}
 
-	if (overlapPub.getNumSubscribers() &&
-		mapCurrentCloud)
+	if (meanErrorScaledUnfilteredPub.getNumSubscribers())
+	{
+		float_msg.data = icp.errorMinimizer->getMean() * 10;
+		meanErrorScaledUnfilteredPub.publish(float_msg);
+	}
+
+	if (overlapUnfilteredPub.getNumSubscribers())
 	{
 		float_msg.data = icp.errorMinimizer->getOverlap();
-		overlapPub.publish(float_msg);
+		overlapUnfilteredPub.publish(float_msg);
 	}
 
 	if (pointUsedRatioPub.getNumSubscribers())
@@ -609,6 +620,13 @@ void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& 
 	{
 		float_msg.data = icp.errorMinimizer->getWeightedPointUsedRatio();
 		weightedPointUsedRatioPub.publish(float_msg);
+	}
+
+	if (overlapPub.getNumSubscribers() &&
+		mapCurrentCloud)
+	{
+		float_msg.data = icp.errorMinimizer->getOverlap();
+		overlapPub.publish(float_msg);
 	}
 
 	if (meanErrorScaledPub.getNumSubscribers() &&
@@ -642,7 +660,6 @@ void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& 
 
 void Mapper::processNewMapIfAvailable()
 {
-	ROS_INFO_STREAM("processNewMapIfAvailable");
 	#if BOOST_VERSION >= 104100
 	if (mapBuildingInProgress && mapBuildingFuture.has_value())
 	{
@@ -655,7 +672,6 @@ void Mapper::processNewMapIfAvailable()
 
 void Mapper::setMap(DP* newPointCloud)
 {
-	ROS_INFO_STREAM("Set map.");
 	// delete old map
 	if (mapPointCloud)
 		delete mapPointCloud;
@@ -668,7 +684,6 @@ void Mapper::setMap(DP* newPointCloud)
 	// FIXME this crash when used without descriptor
 	if (mapPub.getNumSubscribers())
 		mapPub.publish(PointMatcher_ros::pointMatcherCloudToRosMsg<float>(*mapPointCloud, mapFrame, mapCreationTime));
-	ROS_INFO_STREAM("Set map finished.");
 }
 
 Mapper::DP* Mapper::updateMap(DP* newPointCloud, const PM::TransformationParameters Ticp, bool updateExisting)
