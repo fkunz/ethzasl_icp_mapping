@@ -43,6 +43,13 @@ class Mapper
 	typedef PointMatcher<float> PM;
 	typedef PM::DataPoints DP;
 
+	struct ICPResult {
+		double meanError;
+		double overlap;
+		bool localize = false;
+		bool map = false;
+	};
+
 	ros::NodeHandle& n;
 	ros::NodeHandle& pn;
 	
@@ -94,6 +101,13 @@ class Mapper
 	bool mapBuildingInProgress;
 	#endif // BOOST_VERSION >= 104100
 
+	double slidingAverageMapped;
+	double slidingAverageTotal;
+	double bestUnmappedPointCloudError;
+	DP *bestUnmappedPointCloud;
+	ros::Time bestUnmappedPointCloudStamp;
+	std::deque<ICPResult> lastICPResults;
+
 	// Parameters
 	bool useConstMotionModel;
 	bool processingNewCloud;
@@ -134,7 +148,11 @@ protected:
 	bool prepareForICP(DP* cloud, const std::string& scannerFrame, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner);
 	bool applyICP(DP* cloud, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp);
 	void applyMapping(DP* cloud, const ros::Time& stamp, PM::TransformationParameters& Ticp);
+	void processICPMetrics(ICPResult& currentICPResult);
 	void writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp);
+	void updateSlidingAverage(bool mapCurrentScan);
+	double calculateDynamicMeanErrorLimit();
+	double calculateMeanErrorAverage();
 	void processNewMapIfAvailable();
 	void setMap(DP* newPointCloud);
 	DP* updateMap(DP* newPointCloud, const PM::TransformationParameters Ticp, bool updateExisting);
@@ -298,7 +316,9 @@ Mapper::Mapper(ros::NodeHandle& n, ros::NodeHandle& pn):
 	// refreshing tf transform thread
 	publishThread = boost::thread(boost::bind(&Mapper::publishLoop, this, tfRefreshPeriod));
 
-	logfile.open ("icp_mapper.log");
+	logfile.open("icp_mapper.log");
+	slidingAverageMapped = 0;
+	slidingAverageTotal = 0;
 }
 
 Mapper::~Mapper()
@@ -378,7 +398,21 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 
 	writeDebugInfo(mapCurrentCloud, TScannerToMap, TOdomToScanner, Ticp);
 
-	// check if news points should be added to the map
+
+	if (mapBuildingInProgress)
+	{
+		ROS_WARN_STREAM("mapBuildingInProgress");
+		if (!mapBuildingFuture.has_value())
+		{
+			timer dt;
+			mapBuildingFuture.wait();
+			if (mapBuildingFuture.has_value())
+				ROS_WARN_STREAM("Waited for mapBuilding for: " << dt.elapsed());
+		}
+		processNewMapIfAvailable();
+	}
+
+	// check if new points should be added to the map
 	if (mapCurrentCloud)
 		ROS_WARN_STREAM("mapCurrentCloud");
 	if (mapCurrentCloud &&
@@ -392,7 +426,16 @@ void Mapper::processCloud(unique_ptr<DP> newPointCloud, const std::string& scann
 		applyMapping(newDataPoints, stamp, Ticp);
 	} else
 	{
-		delete newDataPoints;
+		if (icp.errorMinimizer->getMean() < bestUnmappedPointCloudError)
+		{
+			if (bestUnmappedPointCloud)
+				delete bestUnmappedPointCloud;
+			bestUnmappedPointCloud = newDataPoints;
+			bestUnmappedPointCloudError = icp.errorMinimizer->getMean();
+			bestUnmappedPointCloudStamp = stamp;
+		}
+		else
+			delete newDataPoints;
 	}
 
 	//Statistics about time and real-time capability
@@ -491,48 +534,17 @@ bool Mapper::prepareForICP(DP* newPointCloud, const std::string& scannerFrame, c
 
 bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp)
 {
-	bool mapCurrentCloud = mapping;
+	ICPResult currentICPResult;
 	try
 	{
 		// Apply ICP
 		Ticp = icp(*newPointCloud, TScannerToMap);
-
 		ROS_DEBUG_STREAM("Ticp:\n" << Ticp);
-		const double estimatedOverlap = icp.errorMinimizer->getOverlap();
-		const double meanError = icp.errorMinimizer->getMean();
-		ROS_DEBUG_STREAM("Overlap: " << estimatedOverlap);
-		ROS_DEBUG_STREAM("Mean Error: " << meanError);
 
-		// Ensure minimum overlap for localization
-		if (estimatedOverlap < minOverlapToLocalize)
-		{
-			ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!" << estimatedOverlap << "/" << minOverlapToLocalize);
+		// Decide what to do, based on ICP metrics
+		processICPMetrics(currentICPResult);
+		if (!currentICPResult.localize)
 			return false;
-		}
-
-		// Ensure maximum mean error for localization
-		if (meanError > maxMeanErrorToLocalize)
-		{
-			ROS_ERROR_STREAM("Mean error too big, ignoring ICP correction! " << meanError << "/" << maxMeanErrorToLocalize);
-			return false;
-		}
-
-		// Ensure maximum mean error for mapping
-		if (meanError > maxMeanError)
-		{
-			ROS_ERROR_STREAM("Mean error too big, ignoring point cloud! " << meanError << "/" << maxMeanError);
-			mapCurrentCloud = false;
-		}
-
-		// Ensure minimum scan quality for mapping
-		if (estimatedOverlap > minOverlapToMerge &&
-			meanError > maxMeanErrorToMerge)
-		{
-			ROS_ERROR_STREAM("Overlap to small and mean error to big, ignoring point cloud! "
-							 << estimatedOverlap << "/" << minOverlapToMerge << " "
-							 << meanError << "/" << maxMeanErrorToMerge);
-			mapCurrentCloud = false;
-		}
 
 		// Compute tf
 		publishStamp = stamp;
@@ -563,7 +575,7 @@ bool Mapper::applyICP(DP* newPointCloud, const ros::Time& stamp, PM::Transformat
 		ROS_ERROR_STREAM("ICP failed to converge: " << error.what());
 		return false;
 	}
-	return mapCurrentCloud;
+	return currentICPResult.map;
 }
 
 void Mapper::applyMapping(DP* newPointCloud, const ros::Time& stamp, PM::TransformationParameters& Ticp)
@@ -580,6 +592,67 @@ void Mapper::applyMapping(DP* newPointCloud, const ros::Time& stamp, PM::Transfo
 	ROS_INFO("Adding new points to the map");
 	setMap(updateMap( newPointCloud, Ticp, true));
 	#endif // BOOST_VERSION >= 104100
+}
+
+void Mapper::processICPMetrics(ICPResult &currentICPResult)
+{
+	const double estimatedOverlap = icp.errorMinimizer->getOverlap();
+	const double meanError = icp.errorMinimizer->getMean();
+	currentICPResult.overlap = estimatedOverlap;
+	currentICPResult.meanError = meanError;
+	ROS_INFO_STREAM("Overlap: " << estimatedOverlap);
+	ROS_INFO_STREAM("Mean Error: " << meanError);
+
+	// Ensure minimum overlap for localization
+	if (estimatedOverlap < minOverlapToLocalize)
+	{
+		ROS_ERROR_STREAM("Estimated overlap too small, ignoring ICP correction!" << estimatedOverlap << "/" << minOverlapToLocalize);
+		return;
+	}
+
+	// Ensure maximum mean error for localization
+	if (meanError > maxMeanErrorToLocalize)
+	{
+		ROS_ERROR_STREAM("Mean error too big, ignoring ICP correction! " << meanError << "/" << maxMeanErrorToLocalize);
+		return;
+	}
+	currentICPResult.localize = true;
+	currentICPResult.map = mapping;
+
+	// Ensure maximum mean error for mapping
+	double dynamicMaxMeanError = calculateDynamicMeanErrorLimit();
+	if (meanError > dynamicMaxMeanError)
+	{
+		ROS_WARN_STREAM("Mean error too big, ignoring point cloud! " << meanError << "/" << dynamicMaxMeanError);
+		currentICPResult.map = false;
+	}
+	updateSlidingAverage(currentICPResult.map);
+	ROS_INFO("slidingAverageMapped: %f", slidingAverageMapped);
+	ROS_INFO("slidingAverageTotal: %f", slidingAverageTotal);
+
+	double averageMeanErrorLimit = calculateMeanErrorAverage() * 1.0;
+//	if (meanError > averageMeanErrorLimit)
+//	{
+//		ROS_ERROR_STREAM("Mean error bigger than averageMeanError! " << meanError << "/" << averageMeanErrorLimit);
+//		currentICPResult.map = false;
+//	}
+
+	// Ensure minimum scan quality for mapping
+	if (estimatedOverlap > minOverlapToMerge &&
+		meanError > maxMeanErrorToMerge)
+	{
+		ROS_WARN_STREAM("Overlap to small and mean error to big, ignoring point cloud! "
+						 << estimatedOverlap << "/" << minOverlapToMerge << " "
+						 << meanError << "/" << maxMeanErrorToMerge);
+		currentICPResult.map = false;
+	}
+
+	if (lastICPResults.size() == lastICPResults.max_size() ||
+		lastICPResults.size() >= 30)
+		lastICPResults.pop_front();
+	lastICPResults.push_back(currentICPResult);
+	ROS_INFO_STREAM("[processICPMetrics] currentICPResult.localize: " << currentICPResult.localize);
+	ROS_INFO_STREAM("[processICPMetrics] currentICPResult.map: " << currentICPResult.map);
 }
 
 void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& TScannerToMap, PM::TransformationParameters& TOdomToScanner, PM::TransformationParameters& Ticp)
@@ -656,6 +729,62 @@ void Mapper::writeDebugInfo(bool mapCurrentCloud, PM::TransformationParameters& 
 	logfile << "\nTicp\n" << Ticp;
 	logfile << "\nTOdomToMap\n" << Ticp * TOdomToScanner;
 	logfile << "\n-----------------------------------------------------------------------------------------------------\n";
+}
+
+void Mapper::updateSlidingAverage(bool mapCurrentScan)
+{
+	if (slidingAverageTotal == 0)
+		slidingAverageTotal = icp.errorMinimizer->getMean();
+
+	slidingAverageTotal = slidingAverageTotal*0.7 + icp.errorMinimizer->getMean()*0.3;
+
+	if (mapCurrentScan)
+	{
+		if (slidingAverageMapped == 0)
+			slidingAverageMapped = icp.errorMinimizer->getMean();
+		slidingAverageMapped = slidingAverageMapped*0.7 + icp.errorMinimizer->getMean()*0.3;
+	}
+}
+
+double Mapper::calculateDynamicMeanErrorLimit()
+{
+	uint lookBackDist = 4;
+	uint lastUnmappedScans = 0;
+	for (uint i = lastICPResults.size() - lookBackDist; i < lastICPResults.size(); ++i)
+	{
+		if (lastICPResults[i].map)
+			break;
+		++lastUnmappedScans;
+	}
+	return maxMeanError + 0.001 * lastUnmappedScans;
+}
+
+double Mapper::calculateMeanErrorAverage()
+{
+	uint lookBackDist = 6;
+	if (lastICPResults.size() < lookBackDist)
+		return 1;
+
+	double mappedAverage = 0;
+	double totalAverage = 0;
+	uint mappedClouds = 0;
+	for (uint i = lastICPResults.size() - lookBackDist; i < lastICPResults.size(); ++i)
+	{
+		if (lastICPResults[i].map)
+		{
+			mappedAverage += lastICPResults[i].meanError;
+			++mappedClouds;
+		}
+		totalAverage += lastICPResults[i].meanError;
+	}
+	totalAverage /= lookBackDist;
+	ROS_INFO("totalAverage: %f", totalAverage);
+	if (mappedClouds == 0)
+		return totalAverage;
+
+	mappedAverage /= mappedClouds;
+	ROS_INFO("mappedAverage: %f", mappedAverage);
+	return mappedAverage;
 }
 
 void Mapper::processNewMapIfAvailable()
